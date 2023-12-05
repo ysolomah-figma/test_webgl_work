@@ -1,0 +1,353 @@
+<html>
+   <head></head>
+   <body>
+      <p style="text-align:center;">
+         Average Frame-to-Frame Time: <span id="frameDurationSpan">0</span> ms<br />
+         Average User Perceived FPS: <span id="fpsSpan">0</span> <br />
+         Average CPU Time spent in onFrame: <span id="cpuTimeSpan">0</span> ms<br />
+         <!-- Average FPS adjusted by CPU time: <span id="fpsWithCpuTimeSpan">0</span> <br /> -->
+         Average FPS given by WebGL2 query timer: <span id="webGl2QueryFps">0</span> <br />
+      </p>
+      <canvas id="theCanvas"></canvas>
+      <script>
+         // Set ADD_50MS_CPU_WORK true to add non-GPU related CPU work.
+         const ADD_50MS_CPU_WORK = false;
+         // Set NUM_DRAW_ITERATIONS_PER_FRAME to a higher number to increase the GPU work.
+         const NUM_DRAW_ITERATIONS_PER_FRAME = 12;
+         // Number of frames to pass to run WebGL query timer
+         const NUM_FRAMES_BETWEEN_QUERY_TIMER = 10;
+
+         const TEXTURE_DIMENSION = 256;
+         const CANVAS_TEXTURE_REPETITIONS = 5;
+         const CANVAS_DIMENSION = TEXTURE_DIMENSION * CANVAS_TEXTURE_REPETITIONS;
+         const CANVAS_CSS_DIMENSION = CANVAS_DIMENSION / window.devicePixelRatio;
+         const FLUSH_EVERY_N_DRAW_ITERATIONS = 0; // does not flush if set to 0
+         const DRAW_FIRST_TO_TILE_TEXTURE = true;
+         const USE_BACKBUFFER = true;
+
+         const frameDurationSpan = document.getElementById('frameDurationSpan');
+         const fpsSpan = document.getElementById('fpsSpan');
+         const cpuTimeSpan = document.getElementById('cpuTimeSpan')
+         //const fpsAdjustedSpan = document.getElementById('fpsWithCpuTimeSpan')
+         const webGl2FpsSpan = document.getElementById('webGl2QueryFps')
+
+         const theCanvas = document.getElementById('theCanvas');
+         theCanvas.style.width = `${CANVAS_CSS_DIMENSION}px`;
+         theCanvas.style.height = `${CANVAS_CSS_DIMENSION}px`;
+         theCanvas.width = CANVAS_DIMENSION;
+         theCanvas.height = CANVAS_DIMENSION;
+
+         const gl = theCanvas.getContext('webgl2', {
+           // Setting antialias=false eliminates the perf cliff I was seeing on my
+           // iPad when blitting tiles directly to the onscreen canvas rather than a
+           // backbuffer. Still using a backbuffer in this test for now, though.
+           antialias: false,
+           // Apple suggests we use this for iOS, though for this test on my iPad,
+           // I'm not seeing a perf difference.
+           preserveDrawingBuffer: false,
+           powerPreference: 'high-performance'
+         });
+         console.log(gl)
+         if (!gl) {
+           throw new Error('failed to create context!');
+         }
+         theCanvas.addEventListener('webglcontextlost', () => {
+           throw new Error('WebGL context lost!');
+         });
+
+         function createDrawColorProgram() {
+           const program = gl.createProgram();
+           const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+           gl.shaderSource(vertexShader, `
+             precision highp float;
+             attribute vec2 aPos;
+             void main() {
+               gl_Position = vec4(aPos*2. - 1., 0., 1.);
+             }
+           `);
+           gl.compileShader(vertexShader);
+           gl.attachShader(program, vertexShader);
+           const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+           gl.shaderSource(fragmentShader, `
+             precision highp float;
+             uniform vec4 uColor;
+             void main() {
+               gl_FragColor = uColor;
+             }
+           `);
+           gl.compileShader(fragmentShader);
+           gl.attachShader(program, fragmentShader);
+           gl.bindAttribLocation(program, 0, "aPos");
+           gl.linkProgram(program);
+           if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+             throw new Error(`Failed to link shader: ${gl.getProgramInfoLog(program)}`);
+           }
+
+           return program;
+         }
+         const drawColorProgram = createDrawColorProgram();
+         const drawColorProgram_uColorLocation = gl.getUniformLocation(drawColorProgram, "uColor");
+
+         function createBlitTextureProgram() {
+           const program = gl.createProgram();
+           const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+           gl.shaderSource(vertexShader, `
+             precision highp float;
+             attribute vec2 aPos;
+             varying vec2 vUV;
+             void main() {
+               vUV = aPos;
+               gl_Position = vec4(aPos*2. - 1., 0., 1.);
+             }
+           `);
+           gl.compileShader(vertexShader);
+           gl.attachShader(program, vertexShader);
+           const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+           gl.shaderSource(fragmentShader, `
+             precision highp float;
+             uniform sampler2D uTex;
+             varying vec2 vUV;
+             void main() {
+               gl_FragColor = texture2D(uTex, vUV);
+             }
+           `);
+           gl.compileShader(fragmentShader);
+           gl.attachShader(program, fragmentShader);
+           gl.bindAttribLocation(program, 0, "aPos");
+           gl.linkProgram(program);
+           if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+             throw new Error(`Failed to link shader: ${gl.getProgramInfoLog(program)}`);
+           }
+           return program;
+         }
+         const blitTextureProgram = createBlitTextureProgram();
+         const blitTextureProgram_uTexLocation = gl.getUniformLocation(blitTextureProgram, "uTex");
+
+         // Create and bind quad VBO
+         const quadVBO = gl.createBuffer();
+         gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+         const vertices = new Float32Array([
+           0, 0,
+           1, 0,
+           0, 1,
+           1, 1
+         ]);
+         gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+         gl.enableVertexAttribArray(0);
+         gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+
+         // Allocate texture/FBO
+         const texture = gl.createTexture();
+         gl.bindTexture(gl.TEXTURE_2D, texture);
+         gl.texImage2D(
+           gl.TEXTURE_2D,
+           0, // level
+           gl.RGBA,
+           TEXTURE_DIMENSION, // width
+           TEXTURE_DIMENSION, // height
+           0, // border: must be 0
+           gl.RGBA,
+           gl.UNSIGNED_BYTE,
+           null);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+         const textureFBO = gl.createFramebuffer();
+         gl.bindFramebuffer(gl.FRAMEBUFFER, textureFBO);
+         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+         const textureFBOStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+         if (textureFBOStatus != gl.FRAMEBUFFER_COMPLETE) {
+           throw new Error(`Texture FBO is not complete: ${textureFBOStatus}`);
+         }
+
+         // Allocate backbuffer/FBO
+         const backbuffer = gl.createTexture();
+         gl.bindTexture(gl.TEXTURE_2D, backbuffer);
+         gl.texImage2D(
+           gl.TEXTURE_2D,
+           0, // level
+           gl.RGBA,
+           gl.canvas.width, // width
+           gl.canvas.height, // height
+           0, // border: must be 0
+           gl.RGBA,
+           gl.UNSIGNED_BYTE,
+           null);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+         const backbufferFBO = gl.createFramebuffer();
+         gl.bindFramebuffer(gl.FRAMEBUFFER, backbufferFBO);
+         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, backbuffer, 0);
+         const backbufferFBOStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+         if (backbufferFBOStatus != gl.FRAMEBUFFER_COMPLETE) {
+           throw new Error(`Texture FBO is not complete: ${backbufferFBOStatus}`);
+         }
+
+
+         // Timer parameters
+         let lastFrameTimestampInMs = null;
+         let queryCounter = 0
+         let circularBufferLength = 20
+
+         let webGlQuerySampleIndex = 0
+         let webGlQuerySamplesTimeMs = new Float32Array(circularBufferLength)
+
+         let performanceSampleIndex = 0
+         let performanceSamplesTimeMs = new Float32Array(circularBufferLength)
+
+         let substractableCpuSampleIndex = 0
+         let substractableCpuSamplesTimeMs = new Float32Array(circularBufferLength)
+
+
+         const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+
+         let texImage2DQuery = undefined
+         let nextGpuQueryResultValid = false
+
+         function sleep(ms)
+         {
+          var e = new Date().getTime() + (ms);
+          while (new Date().getTime() <= e) {}
+         }
+
+         //
+         // RAF Loop
+         //
+         const onFrame = () => {
+           queryCounter++;
+
+
+           if (texImage2DQuery) {
+             const available = gl.getQueryParameter(texImage2DQuery, gl.QUERY_RESULT_AVAILABLE);
+             const disjoint = gl.getParameter(ext.GPU_DISJOINT_EXT);
+             // Disjoint query sample
+             if (disjoint) {
+               gl.deleteQuery(texImage2DQuery)
+               texImage2DQuery = undefined
+             }
+             // Valid
+             else if (!disjoint && available && nextGpuQueryResultValid) {
+                 const elapsedMs = gl.getQueryParameter(texImage2DQuery, gl.QUERY_RESULT) / 1000000
+                 nextGpuQueryResultValid = false
+                 webGlQuerySamplesTimeMs[webGlQuerySampleIndex % circularBufferLength] = elapsedMs
+                 webGlQuerySampleIndex++
+                 texImage2DQuery = undefined
+             }
+           }
+
+           // Kick off query once every 50 frames
+           let shouldRunGpuQueryThisCycle = queryCounter % NUM_FRAMES_BETWEEN_QUERY_TIMER == 0 && !texImage2DQuery
+
+           // Record start of RAF loop before we being CPU work
+           const thisFrameTimestampInMs = performance.now();
+
+           // Adding CPU work that doesn't load GPU
+           if (ADD_50MS_CPU_WORK) {
+            sleep(50)
+           }
+
+
+           // Begin the query
+           if (shouldRunGpuQueryThisCycle) {
+            texImage2DQuery = gl.createQuery();
+            gl.beginQuery(ext.TIME_ELAPSED_EXT, texImage2DQuery);
+           }
+
+           // Perceived FPS
+          if (lastFrameTimestampInMs != null) {
+            performanceSamplesTimeMs[performanceSampleIndex % circularBufferLength] = thisFrameTimestampInMs - lastFrameTimestampInMs;
+            performanceSampleIndex++;
+          }
+
+
+          // Update all timers
+           if (lastFrameTimestampInMs != null) {
+             const elapsedMs = performanceSamplesTimeMs.reduce((partialSum, a) => partialSum + a, 0) / Math.min(performanceSampleIndex, circularBufferLength);
+             const fps = 1000.0 / elapsedMs;
+             frameDurationSpan.innerText = elapsedMs.toFixed(2);
+             fpsSpan.innerText = fps.toFixed(2);
+             cpuTimeSpan.innerText = (substractableCpuSamplesTimeMs.reduce((partialSum, a) => partialSum + a, 0) / Math.min(substractableCpuSampleIndex, circularBufferLength)).toFixed(2);
+             //fpsAdjustedSpan.innerText = (1000.0 / (elapsedMs - (subtractableCpuTotalTime / totalPerformanceSamples))).toFixed(2)
+             webGl2FpsSpan.innerText = (1000.0 / (webGlQuerySamplesTimeMs.reduce((partialSum, a) => partialSum + a, 0) / Math.min(webGlQuerySampleIndex, circularBufferLength))).toFixed(2)
+           }
+
+           // Record new time for perceived frame to frame to time
+           lastFrameTimestampInMs = thisFrameTimestampInMs;
+
+           // ------------ GPU WORK BEGIN ------------
+           if (USE_BACKBUFFER) {
+             // Clear the backbuffer once per frame
+             gl.bindFramebuffer(gl.FRAMEBUFFER, backbufferFBO);
+             gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+             gl.clearColor(0, 0, 0, 1);
+             gl.clear(gl.COLOR_BUFFER_BIT);
+           }
+
+           for (let i = 0; i < NUM_DRAW_ITERATIONS_PER_FRAME; ++i) {
+             for (let x = 0; x < CANVAS_TEXTURE_REPETITIONS; ++x) {
+               for (let y = 0; y < CANVAS_TEXTURE_REPETITIONS; ++y) {
+                 if (DRAW_FIRST_TO_TILE_TEXTURE) {
+                   // First draw a random color to texture
+                   gl.bindFramebuffer(gl.FRAMEBUFFER, textureFBO);
+                   gl.useProgram(drawColorProgram);
+                   gl.viewport(0, 0, TEXTURE_DIMENSION, TEXTURE_DIMENSION);
+                   const randVal = 0.2 + Math.random() * 0.2;
+                   gl.uniform4f(drawColorProgram_uColorLocation, randVal, randVal, randVal, 1.0);
+                   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+                   // Then blit texture to the right place in the backbuffer (or onscreen canvas)
+                   gl.bindFramebuffer(gl.FRAMEBUFFER, USE_BACKBUFFER ? backbufferFBO : null);
+                   gl.useProgram(blitTextureProgram);
+                   gl.viewport(x * TEXTURE_DIMENSION, y * TEXTURE_DIMENSION, TEXTURE_DIMENSION, TEXTURE_DIMENSION);
+                   gl.activeTexture(gl.TEXTURE0);
+                   gl.bindTexture(gl.TEXTURE_2D, texture);
+                   gl.uniform1i(blitTextureProgram_uTexLocation, 0);
+                   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                 } else {
+                   gl.bindFramebuffer(gl.FRAMEBUFFER, USE_BACKBUFFER ? backbufferFBO : null);
+                   gl.useProgram(drawColorProgram);
+                   gl.viewport(x * TEXTURE_DIMENSION, y * TEXTURE_DIMENSION, TEXTURE_DIMENSION, TEXTURE_DIMENSION);
+                   const randVal = 0.2 + Math.random() * 0.2;
+                   gl.uniform4f(drawColorProgram_uColorLocation, randVal, randVal, randVal, 1.0);
+                   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                 }
+               }
+             }
+             if (FLUSH_EVERY_N_DRAW_ITERATIONS > 0 &&
+                 ((i + 1) % FLUSH_EVERY_N_DRAW_ITERATIONS) == 0) {
+               gl.flush();
+             }
+           }
+
+           if (USE_BACKBUFFER) {
+             // Last, blit the backbuffer to the onscreen canvas
+             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+             gl.useProgram(blitTextureProgram);
+             gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+             gl.activeTexture(gl.TEXTURE0);
+             gl.bindTexture(gl.TEXTURE_2D, backbuffer);
+             gl.uniform1i(blitTextureProgram_uTexLocation, 0);
+             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+           }
+           // ------------ GPU WORK END ------------
+
+           // End the query, mark the next result as valid
+           if (shouldRunGpuQueryThisCycle) {
+             gl.endQuery(ext.TIME_ELAPSED_EXT);
+             gl.flush()
+             nextGpuQueryResultValid = true
+           }
+
+           // CPU Time Spent during onFrame
+           substractableCpuSamplesTimeMs[substractableCpuSampleIndex % circularBufferLength] = performance.now() - thisFrameTimestampInMs;
+           substractableCpuSampleIndex++;
+
+           requestAnimationFrame(onFrame);
+         }
+         requestAnimationFrame(onFrame);
+      </script>
+   </body>
+</html>
